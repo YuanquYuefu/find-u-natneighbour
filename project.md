@@ -6,7 +6,7 @@
 
 | 版本 | 腳本 | 說明文檔 | 適用範圍 |
 | --- | --- | --- | --- |
-| 通用版 1.3.0 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ 架構之 NAT VPS，提供 `0~5` 互動菜單與免菜單快捷模式，支援先 IPv4 後 IPv6 自動容錯下載更新，完成同區鄰居人數普查、真實買家識別、繁忙佔空比計算與機場/自用行為診斷 |
+| 通用版 1.3.1 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ / Incus 架構之 NAT VPS，提供 `0~5` 互動菜單與免菜單快捷模式，支援先 IPv4 後 IPv6 自動容錯下載更新，完成同區鄰居人數普查（含 `/16` 跨子網二層廣播域）、真實買家識別、繁忙佔空比計算與機場/自用行為診斷 |
 
 ## 設計目標與行為規範
 
@@ -14,16 +14,18 @@
    - 支援使用者透過單行非靜默 `wget` 指令（強制 `wget -4 ... || wget -6 ...` 先 IPv4 後 IPv6 自動容錯並顯示即時進度）從 `https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh` 下載至 `/usr/local/bin/nat`（或下載為 `nat.sh` 首次執行時自動安裝至 `/usr/local/bin/nat`）。
    - 在 LXC / KVM 終端機中直接輸入 `nat` 無參數執行時，喚出互動式數字菜單：
      - `0. 退出`：退出工具
-     - `1. 看看你有多少鄰居`：執行階段一（同網段二層 ARP 鄰居人數普查與真實買家過濾）
+     - `1. 看看你有多少鄰居`：執行階段一（同網段與二層廣播域 ARP/NDP 鄰居人數普查與真實買家過濾）
      - `2. 看看此時你有多少活躍鄰居`：執行階段二（自動定位在線鄰居，進行母雞外網負載基準測試與鄰居活躍度排行榜，依據相對網關基準 `mdev`、去極值 `trim_mdev` 與 **繁忙佔空比 `busy_pct`** 三重指標鑑別「吃灰閒置」、「探針/輕度自用」、「活躍自用」與「疑似機場/持續大流量」）
      - `3. 先執行1再執行2`：先執行選項 `1` 輸出完整鄰居清單，再直接沿用該次掃描名單無縫執行選項 `2` 活躍度排行
      - `4. 檢查並更新`：強制透過先 IPv4 後 IPv6 自動容錯連線 GitHub 拉取最新版本的 `nat.sh` 並自動覆蓋更新
      - `5. 刪除`：移除 `/usr/local/bin/nat` 全局快捷指令與本地腳本
    - 同時支援命令列快捷參數（`nat 1` / `nat -q`、`nat 2` / `nat --active`、`nat 3` / `nat --both`、`nat 4` / `nat -u`、`nat 5` / `nat --uninstall`）免菜單直接執行。
 
-2. **跨環境通用性（KVM / LXC / 多系統相容）**：
+2. **跨環境通用性（KVM / LXC / Incus / 多系統相容與併發保護）**：
    - 自動偵測預設路由網卡（相容 `eth0`、`ens18`、`enp0s3` 及 LXC 的 `eth0@if...` 格式）、內網網段、預設網關與公網出口 IPv4，不硬編碼特定網段（如 `192.168.30.x`）。
-   - 自動檢測系統 `ping` 對小數秒間隔（`-i 0.1`）的支援度；若遇非 root 權限或精簡版 BusyBox（如 Alpine LXC），自動降級採樣間隔，確保腳本不報錯中斷。
+   - **容器 `cgroup pids.max` 自適應併發控制**：自動偵測 `/sys/fs/cgroup` 階層的 `pids.max` / `pids.current` 與 `ulimit -u`（並在 root 權限下自動解除 `systemd` 對 `user-0.slice` / `ssh.service` 預設 33%/15% 的子配額限制），移除巢狀子 Shell 並進行分批節流（Batch Throttling），防止在嚴格限制行程數的 LXC / Incus 容器中出現 `fork: retry: Resource temporarily unavailable` 錯誤。
+   - **`/16` 等大網段二層廣播域完整普查**：除掃描本機 `/24` 外，自動結合 IPv6 二層全節點組播（`ff02::1%iface`）、LLMNR/DNS 反查與 `ip -4/-6 neigh` MAC 唯一鍵去重，確保在 `/16` 橋接環境（如 Incus `10.88.0.0/16`）下也能完整捕捉跨 `/24` 子網的所有同橋接鄰居。
+   - 自動檢測系統 `ping` 對小數秒間隔（`-i 0.1`）與小數秒超時（`-W 0.25`）的支援度；若遇非 root 權限或精簡版 BusyBox（如 Alpine LXC），自動降級採樣間隔，確保腳本不報錯中斷。
    - 外網基準節點自動從 `168.95.1.1`（台灣 HiNet）、`1.1.1.1`（Cloudflare）、`8.8.8.8`（Google）中實測選取最低延遲節點，適配全球不同地區的 NAT 機房。
 
 3. **真實買家識別邏輯（排除老闆 / 母雞 / 探針節點）**：

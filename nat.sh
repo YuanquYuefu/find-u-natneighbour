@@ -2,13 +2,13 @@
 # ==============================================================================
 # nat-neighbour (nat.sh) — KVM / LXC NAT VPS 鄰居數量普查與活躍度探測工具
 # Repository: https://github.com/YuanquYuefu/find-u-natneighbour
-# Version: 1.3.0
+# Version: 1.3.1
 # License: MIT
 # ==============================================================================
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 INSTALL_PATH="/usr/local/bin/nat"
 REPO_RAW_URL="https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh"
 SAMPLE_COUNT=50
@@ -329,7 +329,7 @@ elif command -v wget >/dev/null 2>&1; then
 fi
 PUB_IP=$(echo "$PUB_IP" | tr -d '[:space:]')
 
-# 檢查 ping 是否支援小數間隔 (-i 0.1)
+# 檢查 ping 是否支援小數間隔 (-i 0.1) 與小數超時 (-W 0.25)
 PING_INTERVAL="0.1"
 if ! ping -c 1 -i 0.1 -W 1 127.0.0.1 >/dev/null 2>&1; then
   if ping -c 1 -i 0.2 -W 1 127.0.0.1 >/dev/null 2>&1; then
@@ -339,6 +339,84 @@ if ! ping -c 1 -i 0.1 -W 1 127.0.0.1 >/dev/null 2>&1; then
     [ "$SAMPLE_COUNT" -gt 10 ] && SAMPLE_COUNT=10
   fi
 fi
+
+PING_WAIT="1"
+if LC_ALL=C ping -c 1 -W 0.25 127.0.0.1 >/dev/null 2>&1; then
+  PING_WAIT="0.25"
+fi
+
+# 自動偵測並優化容器 cgroup pids 限制，計算安全併發上限（防止 fork: Resource temporarily unavailable）
+SCAN_BATCH=48
+STAGE2_BATCH=64
+
+init_concurrency_limits() {
+  # 若為 root，嘗試解除 systemd 對 user-0.slice / session.scope / ssh.service 的預設 33%/15% TasksMax 子配額限制
+  if [ "$(id -u)" -eq 0 ] && [ -d /sys/fs/cgroup ]; then
+    local cg_rel
+    cg_rel=$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)
+    if [ -n "$cg_rel" ] && [ "$cg_rel" != "/" ]; then
+      local cur_path="/sys/fs/cgroup"
+      local IFS='/'
+      for part in $cg_rel; do
+        [ -z "$part" ] && continue
+        cur_path="${cur_path}/${part}"
+        if [ -w "${cur_path}/pids.max" ]; then
+          echo max > "${cur_path}/pids.max" 2>/dev/null || true
+        fi
+      done
+    fi
+    if [ -w /sys/fs/cgroup/system.slice/ssh.service/pids.max ]; then
+      echo max > /sys/fs/cgroup/system.slice/ssh.service/pids.max 2>/dev/null || true
+    fi
+  fi
+
+  local min_avail=999999
+  if [ -d /sys/fs/cgroup ]; then
+    local cg_rel
+    cg_rel=$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup 2>/dev/null || true)
+    local check_paths="/sys/fs/cgroup"
+    if [ -n "$cg_rel" ] && [ "$cg_rel" != "/" ]; then
+      local cur_path="/sys/fs/cgroup"
+      local IFS='/'
+      for part in $cg_rel; do
+        [ -z "$part" ] && continue
+        cur_path="${cur_path}/${part}"
+        check_paths="${check_paths} ${cur_path}"
+      done
+    fi
+    for p in $check_paths; do
+      if [ -r "${p}/pids.max" ] && [ -r "${p}/pids.current" ]; then
+        local pmax pcur
+        pmax=$(cat "${p}/pids.max" 2>/dev/null || echo "max")
+        pcur=$(cat "${p}/pids.current" 2>/dev/null || echo "0")
+        if [[ "$pmax" =~ ^[0-9]+$ ]] && [[ "$pcur" =~ ^[0-9]+$ ]]; then
+          local avail=$((pmax - pcur))
+          [ "$avail" -lt "$min_avail" ] && min_avail="$avail"
+        fi
+      fi
+    done
+  fi
+
+  local ulim_u
+  ulim_u=$(ulimit -u 2>/dev/null || echo "unlimited")
+  if [[ "$ulim_u" =~ ^[0-9]+$ ]] && [ "$ulim_u" -lt "$min_avail" ]; then
+    min_avail="$ulim_u"
+  fi
+
+  if [ "$min_avail" -lt 999999 ]; then
+    local safe_budget=$((min_avail - 25))
+    [ "$safe_budget" -lt 12 ] && safe_budget=12
+    if [ "$safe_budget" -lt "$SCAN_BATCH" ]; then
+      SCAN_BATCH="$safe_budget"
+    fi
+    STAGE2_BATCH="$safe_budget"
+    [ "$STAGE2_BATCH" -gt 120 ] && STAGE2_BATCH=120
+  else
+    STAGE2_BATCH=100
+  fi
+}
+
+init_concurrency_limits
 
 TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t natscan)
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
@@ -383,33 +461,79 @@ is_hypervisor_oui() {
 }
 
 scan_neighbours() {
-  rm -rf "${TMP_DIR}/alive"
+  rm -rf "${TMP_DIR}/alive" "${TMP_DIR}/llmnr"
   mkdir -p "${TMP_DIR}/alive"
 
-  # 子程序併發 Ping 觸發同網段 ARP 解析與存活檢測
-  (
-    if [ -n "$GW_IP" ]; then
-      ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1 &
+  # 1. 發送 IPv6 二層全節點組播 (ff02::1)，1 個行程即可喚醒同橋接所有跨子網鄰居 (如 /16 Incus 橋接)
+  ping -6 -c 2 -i 0.2 -W 1 "ff02::1%${IFACE}" >/dev/null 2>&1 || ping6 -c 2 -i 0.2 -W 1 "ff02::1%${IFACE}" >/dev/null 2>&1 || true
+
+  # 2. 分批受控併發 Ping 本機所在 /24 與預設網關（不使用巢狀子 Shell，避免觸發 cgroup pids.max 限制）
+  local job_cnt=0
+  local target=""
+  if [ -n "$GW_IP" ] && [ "${GW_IP%.*}" != "$NET" ]; then
+    LC_ALL=C ping -c 1 -W "$PING_WAIT" "$GW_IP" > "${TMP_DIR}/alive/${GW_IP}" 2>/dev/null &
+    job_cnt=$((job_cnt + 1))
+  fi
+
+  for i in $(seq 1 254); do
+    target="${NET}.${i}"
+    if [ "$target" = "$MY_IP" ]; then
+      continue
     fi
-    for i in $(seq 1 254); do
-      target="${NET}.${i}"
-      if [ "$target" = "$MY_IP" ]; then
-        continue
+    LC_ALL=C ping -c 1 -W "$PING_WAIT" "$target" > "${TMP_DIR}/alive/${target}" 2>/dev/null &
+    job_cnt=$((job_cnt + 1))
+    if [ "$job_cnt" -ge "$SCAN_BATCH" ]; then
+      wait
+      job_cnt=0
+    fi
+  done
+  wait
+
+  # 3. 若為大於 /24 的大網段 (如 /16)，嘗試透過 LLMNR/DNS 快速反查跨子網鄰居的 IPv4 位址並觸發 ARP
+  if [ "${PREFIX_LEN:-24}" -lt 24 ] && command -v resolvectl >/dev/null 2>&1; then
+    mkdir -p "${TMP_DIR}/llmnr"
+    job_cnt=0
+    local fe80
+    for fe80 in $(ip -6 neigh show dev "$IFACE" 2>/dev/null | awk '/lladdr/ && $1 ~ /^fe80:/ {print $1}'); do
+      resolvectl query --legend=no "$fe80" > "${TMP_DIR}/llmnr/${fe80//:/_}" 2>/dev/null &
+      job_cnt=$((job_cnt + 1))
+      if [ "$job_cnt" -ge "$SCAN_BATCH" ]; then
+        wait
+        job_cnt=0
       fi
-      (
-        if ping -c 1 -W 1 "$target" >/dev/null 2>&1; then
-          touch "${TMP_DIR}/alive/${target}"
-        fi
-      ) &
     done
     wait
-  )
 
-  # 讀取 ARP 鄰居表（僅保留成功解析出 lladdr MAC 的條目）
-  local arp_raw
-  arp_raw=$(ip -4 neigh show dev "$IFACE" 2>/dev/null | awk '
-    /lladdr/ {
+    local llmnr_names
+    llmnr_names=$(awk '{if ($2 != "") print $2}' "${TMP_DIR}/llmnr/"* 2>/dev/null | tr '\n' ' ')
+    if [ -n "$llmnr_names" ]; then
+      job_cnt=0
+      local resolved_ip
+      for resolved_ip in $(resolvectl query -4 --legend=no $llmnr_names 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' | sort -u); do
+        [ "$resolved_ip" = "$MY_IP" ] && continue
+        if [ ! -f "${TMP_DIR}/alive/${resolved_ip}" ]; then
+          LC_ALL=C ping -c 1 -W "$PING_WAIT" "$resolved_ip" > "${TMP_DIR}/alive/${resolved_ip}" 2>/dev/null &
+          job_cnt=$((job_cnt + 1))
+          if [ "$job_cnt" -ge "$SCAN_BATCH" ]; then
+            wait
+            job_cnt=0
+          fi
+        fi
+      done
+      wait
+    fi
+  fi
+
+  # 4. 合併讀取 IPv4 ARP 表與 IPv6 NDP 二層鄰居表（以 lladdr MAC 為唯一鍵去重，優先顯示 IPv4）
+  local arp_v4 arp_v6 arp_raw
+  arp_v4=$(ip -4 neigh show dev "$IFACE" 2>/dev/null)
+  arp_v6=$(ip -6 neigh show dev "$IFACE" 2>/dev/null)
+
+  arp_raw=$(awk -v my_ip="$MY_IP" -v my_mac="$MY_MAC" '
+    function parse_line(is_v6,   ip, mac, state, is_rtr, i) {
       ip = $1
+      if (ip == my_ip) return
+      if (is_v6 && ip !~ /^fe80:/) return
       mac = ""
       for (i = 1; i <= NF; i++) {
         if ($i == "lladdr" && (i + 1) <= NF) {
@@ -417,15 +541,60 @@ scan_neighbours() {
         }
       }
       state = $NF
-      is_router = ($0 ~ /router/) ? 1 : 0
-      if (mac != "" && state != "FAILED" && state != "INCOMPLETE") {
-        print ip, mac, state, is_router
-      }
-    }' | sort -V)
+      is_rtr = ($0 ~ /router/) ? 1 : 0
+      if (mac == "" || mac == my_mac || state == "FAILED" || state == "INCOMPLETE") return
 
-  local gw_mac gw_oui
+      if (!is_v6) {
+        ip_map[mac] = ip
+        state_map[mac] = state
+        if (is_rtr) rtr_map[mac] = 1
+        else if (!(mac in rtr_map)) rtr_map[mac] = 0
+      } else {
+        if (!(mac in ip_map)) {
+          ip_map[mac] = ip
+          state_map[mac] = state
+        }
+        if (is_rtr) rtr_map[mac] = 1
+        else if (!(mac in rtr_map)) rtr_map[mac] = 0
+      }
+    }
+    FNR == NR {
+      if ($0 ~ /lladdr/) parse_line(0)
+      next
+    }
+    {
+      if ($0 ~ /lladdr/) parse_line(1)
+    }
+    END {
+      for (m in ip_map) {
+        print ip_map[m], m, state_map[m], rtr_map[m]
+      }
+    }
+  ' <(echo "$arp_v4") <(echo "$arp_v6") | sort -V)
+
+  # 5. 對僅有 fe80:: 二層位址的跨子網鄰居進行分批單播 Ping 存活確認
+  job_cnt=0
+  local chk_ip
+  for chk_ip in $(echo "$arp_raw" | awk '$1 ~ /^fe80:/ {print $1}'); do
+    local safe_chk="${chk_ip//:/_}"
+    if [ ! -f "${TMP_DIR}/alive/${safe_chk}" ]; then
+      LC_ALL=C ping -c 1 -W "$PING_WAIT" "${chk_ip}%${IFACE}" > "${TMP_DIR}/alive/${safe_chk}" 2>/dev/null &
+      job_cnt=$((job_cnt + 1))
+      if [ "$job_cnt" -ge "$SCAN_BATCH" ]; then
+        wait
+        job_cnt=0
+      fi
+    fi
+  done
+  [ "$job_cnt" -gt 0 ] && wait
+
+  local gw_mac gw_oui gw_net
   gw_mac=$(echo "$arp_raw" | awk -v gw="$GW_IP" '$1 == gw {print $2; exit}')
+  if [ -z "$gw_mac" ]; then
+    gw_mac=$(echo "$arp_raw" | awk '$4 == 1 {print $2; exit}')
+  fi
   gw_oui="${gw_mac:0:8}"
+  gw_net="${GW_IP%.*}"
 
   local my_is_laa=0
   if [ -n "$MY_MAC" ] && is_laa_mac "$MY_MAC"; then
@@ -438,6 +607,7 @@ scan_neighbours() {
   while read -r ip mac state is_router; do
     [ -z "$ip" ] && continue
     [ "$ip" = "$GW_IP" ] || [ "$ip" = "$MY_IP" ] && continue
+    [ -n "$gw_mac" ] && [ "$mac" = "$gw_mac" ] && continue
     non_gw_count=$((non_gw_count + 1))
     if is_laa_mac "$mac"; then
       laa_count=$((laa_count + 1))
@@ -456,18 +626,30 @@ scan_neighbours() {
   while read -r ip mac state is_router; do
     [ -z "$ip" ] && continue
     [ "$ip" = "$MY_IP" ] && continue
+    [ -n "$MY_MAC" ] && [ "$mac" = "$MY_MAC" ] && continue
 
-    local last_octet="${ip##*.}"
+    local is_v6=0
+    [[ "$ip" == *:* ]] && is_v6=1
+    local last_octet=0
+    local ip_net=""
+    if [ "$is_v6" -eq 0 ]; then
+      last_octet="${ip##*.}"
+      ip_net="${ip%.*}"
+    fi
+
     local oui="${mac:0:8}"
+    local safe_ip="${ip//:/_}"
     local ping_ok=0
-    [ -f "${TMP_DIR}/alive/${ip}" ] && ping_ok=1
+    if [ -s "${TMP_DIR}/alive/${safe_ip}" ] && grep -qE "ttl=|bytes from|1 received" "${TMP_DIR}/alive/${safe_ip}" 2>/dev/null; then
+      ping_ok=1
+    fi
 
     local reason=""
     # 規則 1: 預設網關或宣告為 Router 的節點
-    if [ "$ip" = "$GW_IP" ] || [ "$is_router" -eq 1 ]; then
+    if [ "$ip" = "$GW_IP" ] || { [ -n "$gw_mac" ] && [ "$mac" = "$gw_mac" ]; } || [ "$is_router" -eq 1 ]; then
       reason="網關/路由節點 (Gateway)"
-    # 規則 2: 常見保留網關尾號 (.1 / .254)
-    elif [ "$last_octet" -eq 1 ] || [ "$last_octet" -eq 254 ]; then
+    # 規則 2: 常見保留網關尾號 (.1 / .254，在大於 /24 網段中僅排除網關所在子網或邊界)
+    elif [ "$is_v6" -eq 0 ] && { [ "${PREFIX_LEN:-24}" -ge 24 ] || [ "$ip_net" = "$gw_net" ]; } && { [ "$last_octet" -eq 1 ] || [ "$last_octet" -eq 254 ]; }; then
       reason="網段保留網關位 (.${last_octet})"
     # 規則 3: 在面板使用 LAA 隨機 MAC 的環境中，出現宿主機原生固定 OUI (如 PVE bc:24:11)
     elif [ "$panel_uses_laa" -eq 1 ] && ! is_laa_mac "$mac"; then
@@ -479,9 +661,9 @@ scan_neighbours() {
         reason="實體網卡/基礎設施設備 (硬體 OUI ${oui})"
       fi
     # 規則 4: 純固定 OUI 環境下的特殊管理位 (.2 橋接位，或 .100 探針位且 OUI 與本機不同)
-    elif [ "$last_octet" -eq 2 ] && [ "${MY_IP##*.}" -ge 100 ]; then
+    elif [ "$is_v6" -eq 0 ] && [ "$ip_net" = "$NET" ] && [ "$last_octet" -eq 2 ] && [ "${MY_IP##*.}" -ge 100 ]; then
       reason="母雞內網橋接/管理位 (.2)"
-    elif [ "$last_octet" -eq 100 ] && [ "${MY_IP##*.}" -gt 100 ] && [ -n "$MY_MAC" ] && [ "$oui" != "${MY_MAC:0:8}" ]; then
+    elif [ "$is_v6" -eq 0 ] && [ "$ip_net" = "$NET" ] && [ "$last_octet" -eq 100 ] && [ "${MY_IP##*.}" -gt 100 ] && [ -n "$MY_MAC" ] && [ "$oui" != "${MY_MAC:0:8}" ]; then
       reason="疑似母雞探針/管理機 (.100)"
     fi
 
@@ -501,20 +683,30 @@ scan_neighbours() {
 # 選項 1：看看你有多少鄰居（階段一：二層 ARP 普查與真實買家識別）
 # ------------------------------------------------------------------------------
 run_stage1() {
-  echo -e "🔍 ${C_BOLD}[1. 看看你有多少鄰居] 正在併發掃描 ${NET}.0/24 二層 ARP 與存活主機（約 2 秒）...${C_RESET}"
+  local scan_scope="${NET}.0/24"
+  [ "${PREFIX_LEN:-24}" -ne 24 ] && scan_scope="${MY_IP}/${PREFIX_LEN} (含跨子網二層廣播域)"
+  echo -e "🔍 ${C_BOLD}[1. 看看你有多少鄰居] 正在併發掃描 ${scan_scope} 二層 ARP/NDP 與存活主機（約 2 秒）...${C_RESET}"
   scan_neighbours
+
+  local has_v6=0
+  grep -q ':' "$REAL_USERS_FILE" 2>/dev/null && has_v6=1
 
   echo ""
   echo -e "👥 ${C_BOLD}【真實買家鄰居清單】（共 ${C_GREEN}${REAL_COUNT}${C_RESET}${C_BOLD} 位鄰居，含你共 ${C_GREEN}${TOTAL_SHARING}${C_RESET}${C_BOLD} 人共用此 IP）：${C_RESET}"
-  echo -e "  序號  內網 IP          MAC 位址            ARP 狀態    回應類型"
-  echo -e "  ----------------------------------------------------------------------"
+  if [ "$has_v6" -eq 1 ]; then
+    echo -e "  序號  內網 IP / 二層位址         MAC 位址            鄰居狀態    回應類型"
+    echo -e "  --------------------------------------------------------------------------------"
+  else
+    echo -e "  序號  內網 IP          MAC 位址            ARP 狀態    回應類型"
+    echo -e "  ----------------------------------------------------------------------"
+  fi
 
   if [ "$REAL_COUNT" -eq 0 ]; then
     echo -e "  ${C_GREEN}🎉 目前整個網段沒有任何其他買家鄰居在線（你獨享此 IP）！${C_RESET}"
   else
-    awk -F'|' '{
+    awk -F'|' -v w="$( [ "$has_v6" -eq 1 ] && echo 25 || echo 15 )" '{
       ping_str = ($4 == 1) ? "✅ Ping 正常" : "🛡️ 禁Ping(ARP在線)"
-      printf "  #%2d   %-15s  %-18s  %-10s  %s\n", NR, $1, $2, $3, ping_str
+      printf "  #%2d   %-*s  %-18s  %-10s  %s\n", NR, w, $1, $2, $3, ping_str
     }' "$REAL_USERS_FILE"
   fi
 
@@ -619,7 +811,9 @@ parse_ping_file() {
 run_stage2() {
   local reuse_scan="${1:-0}"
   if [ "$reuse_scan" -ne 1 ]; then
-    echo -e "🔍 ${C_BOLD}[2. 看看此時你有多少活躍鄰居] 正在定位 ${NET}.0/24 在線鄰居（約 2 秒）...${C_RESET}"
+    local scan_scope="${NET}.0/24"
+    [ "${PREFIX_LEN:-24}" -ne 24 ] && scan_scope="${MY_IP}/${PREFIX_LEN} (含跨子網二層廣播域)"
+    echo -e "🔍 ${C_BOLD}[2. 看看此時你有多少活躍鄰居] 正在定位 ${scan_scope} 在線鄰居（約 2 秒）...${C_RESET}"
     scan_neighbours
   fi
 
@@ -638,30 +832,40 @@ run_stage2() {
     return 0
   fi
 
-  local wan_info wan_ip wan_label est_sec
+  local wan_info wan_ip wan_label est_sec waves
   wan_info=$(select_wan_anchor)
   wan_ip="${wan_info%%|*}"
   wan_label="${wan_info#*|}"
 
-  est_sec=$(awk -v c="$SAMPLE_COUNT" -v i="$PING_INTERVAL" 'BEGIN {printf "%.1f", c * i + 0.8}')
+  waves=$(( (target_count + STAGE2_BATCH - 1) / STAGE2_BATCH ))
+  [ "$waves" -lt 1 ] && waves=1
+  est_sec=$(awk -v c="$SAMPLE_COUNT" -v i="$PING_INTERVAL" -v w="$waves" 'BEGIN {printf "%.1f", w * (c * i + 0.8)}')
   echo ""
   echo -e "⚡ ${C_BOLD}[2. 看看此時你有多少活躍鄰居] 正在進行微延遲抖動採樣（每台 ${SAMPLE_COUNT} 次，約需 ${est_sec} 秒）...${C_RESET}"
 
   rm -rf "${TMP_DIR}/pings"
-  (
-    mkdir -p "${TMP_DIR}/pings"
-    ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$GW_IP" > "${TMP_DIR}/pings/gw" 2>/dev/null &
-    ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$wan_ip" > "${TMP_DIR}/pings/wan" 2>/dev/null &
+  mkdir -p "${TMP_DIR}/pings"
 
-    while IFS='|' read -r ip mac state ping_ok role; do
-      [ -z "$ip" ] && continue
-      if [ "$ping_ok" -eq 1 ]; then
-        ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$ip" > "${TMP_DIR}/pings/${ip}" 2>/dev/null &
-        sleep 0.01 2>/dev/null || true
+  local job_cnt=0
+  ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$GW_IP" > "${TMP_DIR}/pings/gw" 2>/dev/null &
+  ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$wan_ip" > "${TMP_DIR}/pings/wan" 2>/dev/null &
+  job_cnt=2
+
+  while IFS='|' read -r ip mac state ping_ok role; do
+    [ -z "$ip" ] && continue
+    if [ "$ping_ok" -eq 1 ]; then
+      local ping_dest="$ip"
+      [[ "$ip" == *:* ]] && ping_dest="${ip}%${IFACE}"
+      local safe_ip="${ip//:/_}"
+      ping -c "$SAMPLE_COUNT" -i "$PING_INTERVAL" -W 1 "$ping_dest" > "${TMP_DIR}/pings/${safe_ip}" 2>/dev/null &
+      job_cnt=$((job_cnt + 1))
+      if [ "$job_cnt" -ge "$STAGE2_BATCH" ]; then
+        wait
+        job_cnt=0
       fi
-    done < "$target_file"
-    wait
-  )
+    fi
+  done < "$target_file"
+  wait
 
   local gw_stat wan_stat gw_mdev gw_trim_mdev active_thresh_str light_thresh_str
   gw_stat=$(parse_ping_file "${TMP_DIR}/pings/gw")
@@ -692,10 +896,18 @@ run_stage2() {
     }'
   fi
 
+  local has_v6=0
+  grep -q ':' "$target_file" 2>/dev/null && has_v6=1
+
   echo -e "------------------------------------------------------------------------"
   echo -e "📊 ${C_BOLD}【買家鄰居活躍度與行為診斷排行榜】${C_RESET}（共 ${C_GREEN}${target_count}${C_RESET}${C_BOLD} 人 | 動態抖動門檻: ⚡輕度≥${light_thresh_str}ms / 🔥活躍≥${active_thresh_str}ms）："
-  echo -e "  排名  內網 IP          平均延遲    最大峰值    抖動(mdev)   繁忙佔空比     活躍度與行為診斷"
-  echo -e "  ----------------------------------------------------------------------------------------"
+  if [ "$has_v6" -eq 1 ]; then
+    echo -e "  排名  內網 IP / 二層位址         平均延遲    最大峰值    抖動(mdev)   繁忙佔空比     活躍度與行為診斷"
+    echo -e "  --------------------------------------------------------------------------------------------------"
+  else
+    echo -e "  排名  內網 IP          平均延遲    最大峰值    抖動(mdev)   繁忙佔空比     活躍度與行為診斷"
+    echo -e "  ----------------------------------------------------------------------------------------"
+  fi
 
   local rank_data="${TMP_DIR}/rank_data.txt"
   : > "$rank_data"
@@ -703,8 +915,9 @@ run_stage2() {
   while IFS='|' read -r ip mac state ping_ok role; do
     [ -z "$ip" ] && continue
     if [ "$ping_ok" -eq 1 ]; then
+      local safe_ip="${ip//:/_}"
       local stat
-      stat=$(parse_ping_file "${TMP_DIR}/pings/${ip}")
+      stat=$(parse_ping_file "${TMP_DIR}/pings/${safe_ip}")
       if [ -n "$stat" ]; then
         echo "${ip} ${stat} 1 ${role}" >> "$rank_data"
       else
@@ -718,7 +931,7 @@ run_stage2() {
   local sorted_rank
   sorted_rank=$(sort -k9,9nr -k5,5nr -k4,4nr "$rank_data")
 
-  echo "$sorted_rank" | awk -v gw_mdev="$gw_mdev" -v gw_trim="$gw_trim_mdev" '
+  echo "$sorted_rank" | awk -v gw_mdev="$gw_mdev" -v gw_trim="$gw_trim_mdev" -v ip_w="$( [ "$has_v6" -eq 1 ] && echo 25 || echo 15 )" '
   BEGIN {
     abuse_cnt = 0
     active_cnt = 0
@@ -734,7 +947,7 @@ run_stage2() {
     ip = $1; min = $2; avg = $3; max = $4; mdev = $5; trim_mdev = $6; busy_cnt = $7; busy_pct = $8; ok = $9
     if (ok == 0) {
       stealth_cnt++
-      printf "  #%2d   %-15s    --          --          --          --         🛡️ 禁Ping防火牆 (ARP在線)\n", NR, ip
+      printf "  #%2d   %-*s    --          --          --          --         🛡️ 禁Ping防火牆 (ARP在線)\n", NR, ip_w, ip
       next
     }
 
@@ -752,10 +965,14 @@ run_stage2() {
       tag = "💤 吃灰閒置 (靜止)"
       idle_cnt++
     }
-    printf "  #%2d   %-15s %6.3f ms   %6.3f ms   %6.3f ms    %3d%% (%2d包)    %s\n", NR, ip, avg, max, mdev, busy_pct, busy_cnt, tag
+    printf "  #%2d   %-*s %6.3f ms   %6.3f ms   %6.3f ms    %3d%% (%2d包)    %s\n", NR, ip_w, ip, avg, max, mdev, busy_pct, busy_cnt, tag
   }
   END {
-    printf "  ----------------------------------------------------------------------------------------\n"
+    if (ip_w > 15) {
+      printf "  --------------------------------------------------------------------------------------------------\n"
+    } else {
+      printf "  ----------------------------------------------------------------------------------------\n"
+    }
     printf "  📈 鄰居狀態統計: 🚨 疑似機場/大戶 %d 人 | 🔥 活躍自用 %d 人 | ⚡ 輕度/探針 %d 人 | 💤 吃灰 %d 人", abuse_cnt, active_cnt, light_cnt, idle_cnt
     if (stealth_cnt > 0) {
       printf " | 🛡️ 禁Ping %d 人", stealth_cnt
