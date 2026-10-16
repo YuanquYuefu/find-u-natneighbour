@@ -2,13 +2,13 @@
 # ==============================================================================
 # nat-neighbour (nat.sh) — KVM / LXC NAT VPS 鄰居數量普查與活躍度探測工具
 # Repository: https://github.com/YuanquYuefu/find-u-natneighbour
-# Version: 1.2.0
+# Version: 1.2.1
 # License: MIT
 # ==============================================================================
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 INSTALL_PATH="/usr/local/bin/nat"
 REPO_RAW_URL="https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh"
 SAMPLE_COUNT=50
@@ -51,7 +51,7 @@ ${C_BOLD}nat-neighbour v${VERSION}${C_RESET} — KVM / LXC 通用 NAT 鄰居人�
   1, -q, --quick    看看你有多少鄰居（僅執行階段一：二層 ARP 普查與真實買家識別，約 2 秒）
   2, --active       看看此時你有多少活躍鄰居（執行階段二：微延遲抖動採樣與活躍排行，約 7 秒）
   3, --both         先執行 1 再執行 2（完整執行階段一與階段二）
-  4, -u, --update   檢查並更新（強制透過 IPv6 / IPv4 自動容錯從 GitHub 拉取最新版）
+  4, -u, --update   檢查並更新（強制透過 IPv4 / IPv6 自動容錯從 GitHub 拉取最新版）
   5, --uninstall    刪除（移除已安裝的 ${INSTALL_PATH} 快捷指令與本地腳本）
 
 進階選項:
@@ -87,19 +87,19 @@ install_self() {
   fi
 }
 
-# 強制使用 IPv6 / IPv4 自動容錯且顯示進度下載
+# 強制使用 IPv4 / IPv6 自動容錯且顯示進度下載（先 IPv4 再 IPv6）
 download_with_fallback() {
   local url="$1"
   local out="$2"
   if command -v wget >/dev/null 2>&1; then
-    echo -e "🌐 正在透過 wget (IPv6 / IPv4 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
-    if wget -6 --timeout=10 --tries=1 -O "$out" "$url" || wget -4 --timeout=10 --tries=2 -O "$out" "$url"; then
+    echo -e "🌐 正在透過 wget (先 IPv4 後 IPv6 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
+    if wget -4 --timeout=10 --tries=2 -O "$out" "$url" || wget -6 --timeout=10 --tries=1 -O "$out" "$url"; then
       return 0
     fi
   fi
   if command -v curl >/dev/null 2>&1; then
-    echo -e "🌐 正在透過 curl (IPv6 / IPv4 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
-    if curl -6 -fL --connect-timeout 10 -o "$out" "$url" || curl -4 -fL --connect-timeout 10 -o "$out" "$url"; then
+    echo -e "🌐 正在透過 curl (先 IPv4 後 IPv6 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
+    if curl -4 -fL --connect-timeout 10 -o "$out" "$url" || curl -6 -fL --connect-timeout 10 -o "$out" "$url"; then
       return 0
     fi
   fi
@@ -114,7 +114,7 @@ run_stage4() {
 
   if ! download_with_fallback "$REPO_RAW_URL" "$tmp_new"; then
     rm -f "$tmp_new" "${tmp_new}.lf" 2>/dev/null
-    echo -e "${C_RED}❌ 下載失敗：IPv6 與 IPv4 均無法連線至 GitHub Raw，請檢查本機網路或 DNS 設定。${C_RESET}" >&2
+    echo -e "${C_RED}❌ 下載失敗：IPv4 與 IPv6 均無法連線至 GitHub Raw，請檢查本機網路或 DNS 設定。${C_RESET}" >&2
     echo -e "${C_BOLD}========================================================================${C_RESET}"
     return 1
   fi
@@ -554,14 +554,48 @@ select_wan_anchor() {
 parse_ping_file() {
   local file="$1"
   [ ! -f "$file" ] && return 0
-  awk -F'=' '/rtt|round-trip/ {
-    gsub(/ /, "", $2)
-    split($2, a, "/")
-    gsub(/[a-zA-Z ]/, "", a[4])
-    if (a[2] != "" && a[4] != "") {
-      printf "%.3f %.3f %.3f %.3f", a[1], a[2], a[3], a[4]
+  awk '
+    /time=[0-9.]+/ {
+      if (match($0, /time=[0-9.]+/)) {
+        val = substr($0, RSTART + 5, RLENGTH - 5) + 0
+        n++
+        samples[n] = val
+      }
     }
-  }' "$file"
+    /rtt|round-trip/ {
+      split($0, parts, "=")
+      if (parts[2] != "") {
+        gsub(/ /, "", parts[2])
+        split(parts[2], a, "/")
+        gsub(/[a-zA-Z ]/, "", a[4])
+        s_min = a[1]; s_avg = a[2]; s_max = a[3]; s_mdev = a[4]
+      }
+    }
+    END {
+      if (s_avg == "" || s_mdev == "") exit 0
+      trim_mdev = s_mdev + 0
+      if (n >= 10) {
+        for (i = 2; i <= n; i++) {
+          key = samples[i]
+          j = i - 1
+          while (j >= 1 && samples[j] > key) {
+            samples[j + 1] = samples[j]
+            j--
+          }
+          samples[j + 1] = key
+        }
+        drop = (n >= 20) ? 2 : 1
+        k = n - drop
+        sum = 0
+        for (i = 1; i <= k; i++) sum += samples[i]
+        mean = sum / k
+        sq = 0
+        for (i = 1; i <= k; i++) sq += (samples[i] - mean) * (samples[i] - mean)
+        trim_mdev = sqrt(sq / k)
+      }
+      printf "%.3f %.3f %.3f %.3f %.3f", s_min, s_avg, s_max, s_mdev, trim_mdev
+    }
+  ' "$file"
 }
 
 # ------------------------------------------------------------------------------
@@ -615,10 +649,14 @@ run_stage2() {
     wait
   )
 
-  local gw_stat wan_stat gw_mdev
+  local gw_stat wan_stat gw_mdev gw_trim_mdev active_thresh_str light_thresh_str
   gw_stat=$(parse_ping_file "${TMP_DIR}/pings/gw")
   wan_stat=$(parse_ping_file "${TMP_DIR}/pings/wan")
-  gw_mdev=$(echo "$gw_stat" | awk '{print ($4 != "") ? $4 : 0.050}')
+  gw_mdev=$(echo "$gw_stat" | awk '{print ($4 != "") ? $4 : 0.060}')
+  gw_trim_mdev=$(echo "$gw_stat" | awk '{print ($5 != "") ? $5 : 0.045}')
+
+  active_thresh_str=$(awk -v g="$gw_mdev" 'BEGIN {printf "%.3f", (g * 2.2 > 0.220) ? g * 2.2 : 0.220}')
+  light_thresh_str=$(awk -v g="$gw_mdev" 'BEGIN {printf "%.3f", (g * 1.5 > 0.120) ? g * 1.5 : 0.120}')
 
   echo -e "------------------------------------------------------------------------"
   echo -e "🌐 ${C_BOLD}【本區母雞與外網負載基準】${C_RESET} (平均延遲 avg / 最大峰值 max / 抖動 mdev)"
@@ -629,10 +667,10 @@ run_stage2() {
   fi
   if [ -n "$wan_stat" ]; then
     echo "$wan_stat" | awk -v wip="$wan_ip" -v wlbl="$wan_label" '{
-      if ($4 >= 3.0 || $2 >= 25.0) {
+      if ($4 >= 3.0) {
         tag = "🔥 外網高峰擁擠 (有鄰居正在跑大流量)"
-      } else if ($4 >= 1.2 || $2 >= 12.0) {
-        tag = "⚡ 外網輕度負載 (有鄰居間歇使用)"
+      } else if ($4 >= 1.0) {
+        tag = "⚡ 外網輕度波動 (有鄰居間歇使用)"
       } else {
         tag = "✅ 外網非常空閒 (頻寬充裕)"
       }
@@ -641,7 +679,7 @@ run_stage2() {
   fi
 
   echo -e "------------------------------------------------------------------------"
-  echo -e "📊 ${C_BOLD}【買家鄰居活躍度排行榜】${C_RESET}（共檢測 ${C_GREEN}${target_count}${C_RESET}${C_BOLD} 位在線鄰居，依微抖動 mdev 由高至低排序）："
+  echo -e "📊 ${C_BOLD}【買家鄰居活躍度排行榜】${C_RESET}（共 ${C_GREEN}${target_count}${C_RESET}${C_BOLD} 人 | 動態抖動門檻: ⚡輕度≥${light_thresh_str}ms / 🔥活躍≥${active_thresh_str}ms）："
   echo -e "  排名  內網 IP          平均延遲    最大峰值    抖動(mdev)   活躍度狀態"
   echo -e "  ----------------------------------------------------------------------"
 
@@ -656,39 +694,40 @@ run_stage2() {
       if [ -n "$stat" ]; then
         echo "${ip} ${stat} 1 ${role}" >> "$rank_data"
       else
-        echo "${ip} 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
+        echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
       fi
     else
-      echo "${ip} 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
+      echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
     fi
   done < "$target_file"
 
   local sorted_rank
-  sorted_rank=$(sort -k6,6nr -k5,5nr -k4,4nr "$rank_data")
+  sorted_rank=$(sort -k7,7nr -k5,5nr -k4,4nr "$rank_data")
 
-  echo "$sorted_rank" | awk -v gw_mdev="$gw_mdev" '
+  echo "$sorted_rank" | awk -v gw_mdev="$gw_mdev" -v gw_trim="$gw_trim_mdev" '
   BEGIN {
     active_cnt = 0
     light_cnt = 0
     idle_cnt = 0
     stealth_cnt = 0
+    active_thresh = (gw_mdev * 2.2 > 0.220) ? gw_mdev * 2.2 : 0.220
+    light_thresh  = (gw_mdev * 1.5 > 0.120) ? gw_mdev * 1.5 : 0.120
+    trim_active_thresh = (gw_trim * 1.8 > 0.100) ? gw_trim * 1.8 : 0.100
+    trim_light_thresh  = (gw_trim * 1.35 > 0.065) ? gw_trim * 1.35 : 0.065
   }
   {
-    ip = $1; min = $2; avg = $3; max = $4; mdev = $5; ok = $6
+    ip = $1; min = $2; avg = $3; max = $4; mdev = $5; trim_mdev = $6; ok = $7
     if (ok == 0) {
       stealth_cnt++
       printf "  #%2d   %-15s    --        --        --       🛡️ 禁Ping防火牆 (ARP在線)\n", NR, ip
       next
     }
 
-    # 綜合絕對抖動閾值與相對網關基準倍數判定活躍度
-    active_thresh = (gw_mdev * 2.5 > 0.140) ? gw_mdev * 2.5 : 0.140
-    light_thresh  = (gw_mdev * 1.4 > 0.060) ? gw_mdev * 1.4 : 0.060
-
-    if (mdev >= active_thresh || max >= 1.500) {
+    # 依據相對網關基準抖動 (mdev) 與去極值抖動 (trim_mdev) 雙重確認，避免單次 max 尖峰誤判
+    if (mdev >= active_thresh && trim_mdev >= trim_active_thresh) {
       tag = "🔥 活躍跑流量中"
       active_cnt++
-    } else if (mdev >= light_thresh || max >= 0.700) {
+    } else if (mdev >= light_thresh && trim_mdev >= trim_light_thresh) {
       tag = "⚡ 輕度活動/間歇連線"
       light_cnt++
     } else {
@@ -698,14 +737,13 @@ run_stage2() {
     printf "  #%2d   %-15s %6.3f ms   %6.3f ms   %6.3f ms    %s\n", NR, ip, avg, max, mdev, tag
   }
   END {
-    total_active = active_cnt + light_cnt
     printf "  ----------------------------------------------------------------------\n"
     printf "  📈 鄰居狀態統計: 🔥 活躍 %d 人 | ⚡ 輕度 %d 人 | 💤 吃灰 %d 人", active_cnt, light_cnt, idle_cnt
     if (stealth_cnt > 0) {
       printf " | 🛡️ 禁Ping %d 人", stealth_cnt
     }
     printf "\n"
-    printf "  📌 活躍探測結論: 此時共有 %d 位活躍鄰居（🔥 高頻跑流量 %d 人 + ⚡ 輕度活動 %d 人）\n", total_active, active_cnt, light_cnt
+    printf "  📌 活躍探測結論: 此時正在跑流量的活躍鄰居 %d 人 | 輕度間歇活動 %d 人 | 吃灰閒置 %d 人\n", active_cnt, light_cnt, idle_cnt
   }'
 
   echo -e "${C_BOLD}========================================================================${C_RESET}"
