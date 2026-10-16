@@ -1,18 +1,23 @@
-# nat-neighbour 項目約定
+# find-u-natneighbour 項目約定
+
+倉庫地址：[https://github.com/YuanquYuefu/find-u-natneighbour](https://github.com/YuanquYuefu/find-u-natneighbour)
 
 ## 版本與入口
 
 | 版本 | 腳本 | 說明文檔 | 適用範圍 |
 | --- | --- | --- | --- |
-| 通用版 1.0.0 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ 架構之 NAT VPS，自動完成同區鄰居人數普查、真實買家識別與活躍度排行 |
+| 通用版 1.1.0 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ 架構之 NAT VPS，提供 `0/1/2/3` 互動菜單與免菜單快捷模式，完成同區鄰居人數普查、真實買家識別與活躍鄰居排行 |
 
 ## 設計目標與行為規範
 
-1. **一鍵安裝與極簡呼叫**：
-   - 支援使用者透過單行 `wget` 指令下載至 `/usr/local/bin/nat`（或下載為 `nat.sh` 首次執行時自動安裝至 `/usr/local/bin/nat`）。
-   - 在 LXC / KVM 終端機中直接輸入 `nat` 無參數執行時，必須自動連續執行兩段核心任務：
-     1. **階段一：同網段鄰居人數普查與真實買家過濾**
-     2. **階段二：母雞外網負載基準測試與鄰居活躍度排行榜**
+1. **一鍵安裝與互動菜單呼叫**：
+   - 支援使用者透過單行 `wget` 指令直接從 `https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh` 下載至 `/usr/local/bin/nat`（或下載為 `nat.sh` 首次執行時自動安裝至 `/usr/local/bin/nat`）。
+   - 在 LXC / KVM 終端機中直接輸入 `nat` 無參數執行時，喚出互動式數字菜單：
+     - `0. 退出`：退出工具
+     - `1. 看看你有多少鄰居`：執行階段一（同網段二層 ARP 鄰居人數普查與真實買家過濾）
+     - `2. 看看此時你有多少活躍鄰居`：執行階段二（自動定位在線鄰居，進行母雞外網負載基準測試與鄰居活躍度排行榜，統計當下活躍鄰居人數）
+     - `3. 先執行1再執行2`：先執行選項 `1` 輸出完整鄰居清單，再直接沿用該次掃描名單無縫執行選項 `2` 活躍度排行
+   - 同時支援命令列快捷參數（`nat 1` / `nat -q`、`nat 2` / `nat --active`、`nat 3` / `nat --both`）免菜單直接執行。
 
 2. **跨環境通用性（KVM / LXC / 多系統相容）**：
    - 自動偵測預設路由網卡（相容 `eth0`、`ens18`、`enp0s3` 及 LXC 的 `eth0@if...` 格式）、內網網段、預設網關與公網出口 IPv4，不硬編碼特定網段（如 `192.168.30.x`）。
