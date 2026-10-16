@@ -2,13 +2,13 @@
 # ==============================================================================
 # nat-neighbour (nat.sh) — KVM / LXC NAT VPS 鄰居數量普查與活躍度探測工具
 # Repository: https://github.com/YuanquYuefu/find-u-natneighbour
-# Version: 1.2.1
+# Version: 1.3.0
 # License: MIT
 # ==============================================================================
 
 set -u
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 INSTALL_PATH="/usr/local/bin/nat"
 REPO_RAW_URL="https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh"
 SAMPLE_COUNT=50
@@ -574,7 +574,9 @@ parse_ping_file() {
     END {
       if (s_avg == "" || s_mdev == "") exit 0
       trim_mdev = s_mdev + 0
-      if (n >= 10) {
+      busy_cnt = 0
+      busy_pct = 0
+      if (n >= 5) {
         for (i = 2; i <= n; i++) {
           key = samples[i]
           j = i - 1
@@ -584,16 +586,28 @@ parse_ping_file() {
           }
           samples[j + 1] = key
         }
-        drop = (n >= 20) ? 2 : 1
-        k = n - drop
-        sum = 0
-        for (i = 1; i <= k; i++) sum += samples[i]
-        mean = sum / k
-        sq = 0
-        for (i = 1; i <= k; i++) sq += (samples[i] - mean) * (samples[i] - mean)
-        trim_mdev = sqrt(sq / k)
+        p25_idx = int(n * 0.25) + 1
+        if (p25_idx > n) p25_idx = n
+        p25 = samples[p25_idx]
+        spike_thr = p25 * 2.0 + 0.250
+        if (spike_thr < 0.850) spike_thr = 0.850
+        for (i = 1; i <= n; i++) {
+          if (samples[i] >= spike_thr) busy_cnt++
+        }
+        busy_pct = int((busy_cnt * 100.0) / n + 0.5)
+
+        if (n >= 10) {
+          drop = (n >= 20) ? 2 : 1
+          k = n - drop
+          sum = 0
+          for (i = 1; i <= k; i++) sum += samples[i]
+          mean = sum / k
+          sq = 0
+          for (i = 1; i <= k; i++) sq += (samples[i] - mean) * (samples[i] - mean)
+          trim_mdev = sqrt(sq / k)
+        }
       }
-      printf "%.3f %.3f %.3f %.3f %.3f", s_min, s_avg, s_max, s_mdev, trim_mdev
+      printf "%.3f %.3f %.3f %.3f %.3f %d %d", s_min, s_avg, s_max, s_mdev, trim_mdev, busy_cnt, busy_pct
     }
   ' "$file"
 }
@@ -662,7 +676,7 @@ run_stage2() {
   echo -e "🌐 ${C_BOLD}【本區母雞與外網負載基準】${C_RESET} (平均延遲 avg / 最大峰值 max / 抖動 mdev)"
   if [ -n "$gw_stat" ]; then
     echo "$gw_stat" | awk -v gw="$GW_IP" '{
-      printf "  • 內網網關 (%-13s) : avg %6.3f ms | max %6.3f ms | 抖動 %6.3f ms\n", gw, $2, $3, $4
+      printf "  • 內網網關 (%-13s) : avg %6.3f ms | max %6.3f ms | 抖動 %6.3f ms (繁忙佔空比: %2d%%)\n", gw, $2, $3, $4, $7
     }'
   fi
   if [ -n "$wan_stat" ]; then
@@ -679,9 +693,9 @@ run_stage2() {
   fi
 
   echo -e "------------------------------------------------------------------------"
-  echo -e "📊 ${C_BOLD}【買家鄰居活躍度排行榜】${C_RESET}（共 ${C_GREEN}${target_count}${C_RESET}${C_BOLD} 人 | 動態抖動門檻: ⚡輕度≥${light_thresh_str}ms / 🔥活躍≥${active_thresh_str}ms）："
-  echo -e "  排名  內網 IP          平均延遲    最大峰值    抖動(mdev)   活躍度狀態"
-  echo -e "  ----------------------------------------------------------------------"
+  echo -e "📊 ${C_BOLD}【買家鄰居活躍度與行為診斷排行榜】${C_RESET}（共 ${C_GREEN}${target_count}${C_RESET}${C_BOLD} 人 | 動態抖動門檻: ⚡輕度≥${light_thresh_str}ms / 🔥活躍≥${active_thresh_str}ms）："
+  echo -e "  排名  內網 IP          平均延遲    最大峰值    抖動(mdev)   繁忙佔空比     活躍度與行為診斷"
+  echo -e "  ----------------------------------------------------------------------------------------"
 
   local rank_data="${TMP_DIR}/rank_data.txt"
   : > "$rank_data"
@@ -694,18 +708,19 @@ run_stage2() {
       if [ -n "$stat" ]; then
         echo "${ip} ${stat} 1 ${role}" >> "$rank_data"
       else
-        echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
+        echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 0 0 ${role}" >> "$rank_data"
       fi
     else
-      echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 ${role}" >> "$rank_data"
+      echo "${ip} 0.000 0.000 0.000 0.000 0.000 0 0 0 ${role}" >> "$rank_data"
     fi
   done < "$target_file"
 
   local sorted_rank
-  sorted_rank=$(sort -k7,7nr -k5,5nr -k4,4nr "$rank_data")
+  sorted_rank=$(sort -k9,9nr -k5,5nr -k4,4nr "$rank_data")
 
   echo "$sorted_rank" | awk -v gw_mdev="$gw_mdev" -v gw_trim="$gw_trim_mdev" '
   BEGIN {
+    abuse_cnt = 0
     active_cnt = 0
     light_cnt = 0
     idle_cnt = 0
@@ -716,34 +731,41 @@ run_stage2() {
     trim_light_thresh  = (gw_trim * 1.35 > 0.065) ? gw_trim * 1.35 : 0.065
   }
   {
-    ip = $1; min = $2; avg = $3; max = $4; mdev = $5; trim_mdev = $6; ok = $7
+    ip = $1; min = $2; avg = $3; max = $4; mdev = $5; trim_mdev = $6; busy_cnt = $7; busy_pct = $8; ok = $9
     if (ok == 0) {
       stealth_cnt++
-      printf "  #%2d   %-15s    --        --        --       🛡️ 禁Ping防火牆 (ARP在線)\n", NR, ip
+      printf "  #%2d   %-15s    --          --          --          --         🛡️ 禁Ping防火牆 (ARP在線)\n", NR, ip
       next
     }
 
-    # 依據相對網關基準抖動 (mdev) 與去極值抖動 (trim_mdev) 雙重確認，避免單次 max 尖峰誤判
-    if (mdev >= active_thresh && trim_mdev >= trim_active_thresh) {
-      tag = "🔥 活躍跑流量中"
+    # 結合相對網關抖動 (mdev)、去極值連續抖動 (trim_mdev) 與繁忙佔空比 (busy_pct) 進行行為診斷
+    if (mdev >= active_thresh && trim_mdev >= trim_active_thresh && busy_pct >= 30) {
+      tag = "🚨 疑似機場/持續大流量 (高佔空比)"
+      abuse_cnt++
+    } else if (mdev >= active_thresh && trim_mdev >= trim_active_thresh && busy_pct >= 10) {
+      tag = "🔥 活躍使用中 (自用串流/下載)"
       active_cnt++
-    } else if (mdev >= light_thresh && trim_mdev >= trim_light_thresh) {
-      tag = "⚡ 輕度活動/間歇連線"
+    } else if ((mdev >= light_thresh && trim_mdev >= trim_light_thresh && busy_cnt >= 2) || (mdev >= active_thresh && busy_cnt >= 1)) {
+      tag = "⚡ 間歇微脈衝 (探針/輕度自用)"
       light_cnt++
     } else {
       tag = "💤 吃灰閒置 (靜止)"
       idle_cnt++
     }
-    printf "  #%2d   %-15s %6.3f ms   %6.3f ms   %6.3f ms    %s\n", NR, ip, avg, max, mdev, tag
+    printf "  #%2d   %-15s %6.3f ms   %6.3f ms   %6.3f ms    %3d%% (%2d包)    %s\n", NR, ip, avg, max, mdev, busy_pct, busy_cnt, tag
   }
   END {
-    printf "  ----------------------------------------------------------------------\n"
-    printf "  📈 鄰居狀態統計: 🔥 活躍 %d 人 | ⚡ 輕度 %d 人 | 💤 吃灰 %d 人", active_cnt, light_cnt, idle_cnt
+    printf "  ----------------------------------------------------------------------------------------\n"
+    printf "  📈 鄰居狀態統計: 🚨 疑似機場/大戶 %d 人 | 🔥 活躍自用 %d 人 | ⚡ 輕度/探針 %d 人 | 💤 吃灰 %d 人", abuse_cnt, active_cnt, light_cnt, idle_cnt
     if (stealth_cnt > 0) {
       printf " | 🛡️ 禁Ping %d 人", stealth_cnt
     }
     printf "\n"
-    printf "  📌 活躍探測結論: 此時正在跑流量的活躍鄰居 %d 人 | 輕度間歇活動 %d 人 | 吃灰閒置 %d 人\n", active_cnt, light_cnt, idle_cnt
+    if (abuse_cnt > 0) {
+      printf "  📌 行為診斷結論: ⚠️ 偵測到 %d 台鄰居繁忙佔空比 ≥30%%（疑似機場轉售或持續大流量），若多次複測皆如此可截圖發工單！\n", abuse_cnt
+    } else {
+      printf "  📌 行為診斷結論: ✅ 未發現高佔空比 (≥30%%) 的機場或持續霸佔頻寬鄰居，當前在線鄰居皆屬正常自用範圍。\n"
+    }
   }'
 
   echo -e "${C_BOLD}========================================================================${C_RESET}"
