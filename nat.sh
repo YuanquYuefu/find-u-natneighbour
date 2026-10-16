@@ -11,7 +11,7 @@ set -u
 VERSION="1.3.1"
 INSTALL_PATH="/usr/local/bin/nat"
 REPO_RAW_URL="https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh"
-SAMPLE_COUNT=50
+SAMPLE_COUNT=100
 RUN_MODE=""
 INCLUDE_ALL=0
 
@@ -55,7 +55,7 @@ ${C_BOLD}nat-neighbour v${VERSION}${C_RESET} — KVM / LXC 通用 NAT 鄰居人�
   5, --uninstall    刪除（移除已安裝的 ${INSTALL_PATH} 快捷指令與本地腳本）
 
 進階選項:
-  -c, --count N     指定活躍度採樣 Ping 次數（預設: 50 次，約 5 秒）
+  -c, --count N     指定活躍度採樣 Ping 次數（預設: 100 次，約 10 秒）
   -a, --all         將疑似母雞/老闆手動開的系統節點也納入活躍度排行榜
   --install         手動將本腳本安裝/更新至 ${INSTALL_PATH}
   -h, --help        顯示本幫助說明
