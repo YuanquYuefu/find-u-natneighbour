@@ -2,14 +2,15 @@
 # ==============================================================================
 # nat-neighbour (nat.sh) — KVM / LXC NAT VPS 鄰居數量普查與活躍度探測工具
 # Repository: https://github.com/YuanquYuefu/find-u-natneighbour
-# Version: 1.1.0
+# Version: 1.2.0
 # License: MIT
 # ==============================================================================
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 INSTALL_PATH="/usr/local/bin/nat"
+REPO_RAW_URL="https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh"
 SAMPLE_COUNT=50
 RUN_MODE=""
 INCLUDE_ALL=0
@@ -41,23 +42,24 @@ ${C_BOLD}nat-neighbour v${VERSION}${C_RESET} — KVM / LXC 通用 NAT 鄰居人�
 項目地址: https://github.com/YuanquYuefu/find-u-natneighbour
 
 用法:
-  nat             喚出互動式菜單（0.退出 / 1.看看你有多少鄰居 / 2.看看此時你有多少活躍鄰居 / 3.先執行1再執行2）
-  nat [1|2|3]     免菜單直接執行對應功能
+  nat             喚出互動式菜單（0.退出 / 1.查鄰居 / 2.查活躍鄰居 / 3.先1後2 / 4.檢查並更新 / 5.刪除）
+  nat [1|2|3|4|5] 免菜單直接執行對應功能
   nat [選項]
 
 菜單與快捷模式:
-  0               退出程式
-  1, -q, --quick  看看你有多少鄰居（僅執行階段一：二層 ARP 普查與真實買家識別，約 2 秒）
-  2, --active     看看此時你有多少活躍鄰居（執行階段二：微延遲抖動採樣與活躍排行，約 7 秒）
-  3, --both       先執行 1 再執行 2（完整執行階段一與階段二）
+  0                 退出程式
+  1, -q, --quick    看看你有多少鄰居（僅執行階段一：二層 ARP 普查與真實買家識別，約 2 秒）
+  2, --active       看看此時你有多少活躍鄰居（執行階段二：微延遲抖動採樣與活躍排行，約 7 秒）
+  3, --both         先執行 1 再執行 2（完整執行階段一與階段二）
+  4, -u, --update   檢查並更新（強制透過 IPv6 / IPv4 自動容錯從 GitHub 拉取最新版）
+  5, --uninstall    刪除（移除已安裝的 ${INSTALL_PATH} 快捷指令與本地腳本）
 
 進階選項:
-  -c, --count N   指定活躍度採樣 Ping 次數（預設: 50 次，約 5 秒）
-  -a, --all       將疑似母雞/老闆手動開的系統節點也納入活躍度排行榜
-  --install       手動將本腳本安裝/更新至 ${INSTALL_PATH}
-  --uninstall     移除已安裝的 ${INSTALL_PATH} 快捷指令
-  -h, --help      顯示本幫助說明
-  -v, --version   顯示版本號
+  -c, --count N     指定活躍度採樣 Ping 次數（預設: 50 次，約 5 秒）
+  -a, --all         將疑似母雞/老闆手動開的系統節點也納入活躍度排行榜
+  --install         手動將本腳本安裝/更新至 ${INSTALL_PATH}
+  -h, --help        顯示本幫助說明
+  -v, --version     顯示版本號
 EOF
 }
 
@@ -85,6 +87,116 @@ install_self() {
   fi
 }
 
+# 強制使用 IPv6 / IPv4 自動容錯且顯示進度下載
+download_with_fallback() {
+  local url="$1"
+  local out="$2"
+  if command -v wget >/dev/null 2>&1; then
+    echo -e "🌐 正在透過 wget (IPv6 / IPv4 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
+    if wget -6 --timeout=10 --tries=1 -O "$out" "$url" || wget -4 --timeout=10 --tries=2 -O "$out" "$url"; then
+      return 0
+    fi
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    echo -e "🌐 正在透過 curl (IPv6 / IPv4 自動容錯) 下載: ${C_CYAN}${url}${C_RESET}"
+    if curl -6 -fL --connect-timeout 10 -o "$out" "$url" || curl -4 -fL --connect-timeout 10 -o "$out" "$url"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# 選項 4：檢查並更新
+run_stage4() {
+  echo -e "🔄 ${C_BOLD}[4. 檢查並更新] 當前版本: v${VERSION}，正在連線 GitHub 檢查並拉取最新版本...${C_RESET}"
+  local tmp_new
+  tmp_new=$(mktemp 2>/dev/null || echo "/tmp/nat_update_$$.sh")
+
+  if ! download_with_fallback "$REPO_RAW_URL" "$tmp_new"; then
+    rm -f "$tmp_new" "${tmp_new}.lf" 2>/dev/null
+    echo -e "${C_RED}❌ 下載失敗：IPv6 與 IPv4 均無法連線至 GitHub Raw，請檢查本機網路或 DNS 設定。${C_RESET}" >&2
+    echo -e "${C_BOLD}========================================================================${C_RESET}"
+    return 1
+  fi
+
+  if [ ! -s "$tmp_new" ] || ! grep -q '^VERSION=' "$tmp_new" 2>/dev/null; then
+    rm -f "$tmp_new" "${tmp_new}.lf" 2>/dev/null
+    echo -e "${C_RED}❌ 校驗失敗：下載的檔案內容不完整或非有效腳本，已中止更新。${C_RESET}" >&2
+    echo -e "${C_BOLD}========================================================================${C_RESET}"
+    return 1
+  fi
+
+  tr -d '\r' < "$tmp_new" > "${tmp_new}.lf"
+  local remote_ver
+  remote_ver=$(grep -m1 '^VERSION=' "${tmp_new}.lf" | awk -F'"' '{print $2}')
+  [ -z "$remote_ver" ] && remote_ver="未知"
+
+  local updated_ok=0
+  if [ "$(id -u)" -eq 0 ] || [ -w "$(dirname "$INSTALL_PATH")" ] || [ -w "$INSTALL_PATH" ]; then
+    cp -f "${tmp_new}.lf" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH" 2>/dev/null && updated_ok=1
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo cp -f "${tmp_new}.lf" "$INSTALL_PATH" 2>/dev/null && sudo chmod +x "$INSTALL_PATH" 2>/dev/null && updated_ok=1
+  fi
+
+  local src="${BASH_SOURCE[0]:-$0}"
+  local real_src
+  real_src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+  if [ -f "$real_src" ] && [ "$real_src" != "$INSTALL_PATH" ] && [ -w "$real_src" ]; then
+    cp -f "${tmp_new}.lf" "$real_src" 2>/dev/null && chmod +x "$real_src" 2>/dev/null && updated_ok=1
+  fi
+
+  rm -f "$tmp_new" "${tmp_new}.lf" 2>/dev/null
+
+  if [ "$updated_ok" -eq 1 ]; then
+    if [ "$remote_ver" != "$VERSION" ]; then
+      echo -e "🎉 ${C_GREEN}${C_BOLD}發現新版本並完成更新：v${VERSION} -> v${remote_ver}（路徑: ${INSTALL_PATH}）！${C_RESET}"
+      VERSION="$remote_ver"
+    else
+      echo -e "✅ ${C_GREEN}${C_BOLD}當前已是最新版本 (v${remote_ver})，已重新同步覆蓋至最新腳本！${C_RESET}"
+    fi
+    echo -e "${C_BOLD}========================================================================${C_RESET}"
+    return 0
+  else
+    echo -e "${C_RED}❌ 權限不足：無法寫入 ${INSTALL_PATH}，請使用 root 或 sudo 權限執行。${C_RESET}" >&2
+    echo -e "${C_BOLD}========================================================================${C_RESET}"
+    return 1
+  fi
+}
+
+# 選項 5：刪除
+run_stage5() {
+  echo -e "🗑️  ${C_BOLD}[5. 刪除] 正在從系統中移除 nat-neighbour...${C_RESET}"
+  local removed_any=0
+
+  if [ -f "$INSTALL_PATH" ]; then
+    if rm -f "$INSTALL_PATH" 2>/dev/null || (command -v sudo >/dev/null 2>&1 && sudo rm -f "$INSTALL_PATH" 2>/dev/null); then
+      echo -e "${C_GREEN}✅ 已移除全局快捷指令: ${INSTALL_PATH}${C_RESET}"
+      removed_any=1
+    else
+      echo -e "${C_RED}❌ 無法移除 ${INSTALL_PATH}，請使用 root 或 sudo 權限執行。${C_RESET}" >&2
+      return 1
+    fi
+  fi
+
+  local src="${BASH_SOURCE[0]:-$0}"
+  local real_src
+  real_src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+  if [ -f "$real_src" ] && [ "$real_src" != "$INSTALL_PATH" ]; then
+    if rm -f "$real_src" 2>/dev/null; then
+      echo -e "${C_GREEN}✅ 已移除本地腳本檔案: ${real_src}${C_RESET}"
+      removed_any=1
+    fi
+  fi
+
+  if [ "$removed_any" -eq 0 ]; then
+    echo -e "${C_YELLOW}提示: 系統中未找到已安裝的 ${INSTALL_PATH}${C_RESET}"
+  else
+    echo -e "${C_GREEN}${C_BOLD}👋 刪除完成，感謝使用！${C_RESET}"
+  fi
+  echo -e "${C_BOLD}========================================================================${C_RESET}"
+  exit 0
+}
+
 # 解析命令列參數
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -103,6 +215,14 @@ while [ $# -gt 0 ]; do
       RUN_MODE="3"
       shift
       ;;
+    4|-u|--update)
+      run_stage4
+      exit $?
+      ;;
+    5|--uninstall|--remove)
+      run_stage5
+      exit $?
+      ;;
     -c|--count)
       if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 5 ]; then
         echo -e "${C_RED}錯誤: -c/--count 需要大於等於 5 的整數。${C_RESET}" >&2
@@ -117,15 +237,6 @@ while [ $# -gt 0 ]; do
       ;;
     --install)
       install_self
-      exit 0
-      ;;
-    --uninstall)
-      if [ -f "$INSTALL_PATH" ]; then
-        rm -f "$INSTALL_PATH" 2>/dev/null || sudo rm -f "$INSTALL_PATH"
-        echo -e "${C_GREEN}✅ 已移除 ${INSTALL_PATH}${C_RESET}"
-      else
-        echo -e "${C_YELLOW}提示: 系統中未找到 ${INSTALL_PATH}${C_RESET}"
-      fi
       exit 0
       ;;
     -h|--help)
@@ -628,8 +739,10 @@ while true; do
   echo -e "  ${C_GREEN}1.${C_RESET} 看看你有多少鄰居"
   echo -e "  ${C_CYAN}2.${C_RESET} 看看此時你有多少活躍鄰居"
   echo -e "  ${C_BLUE}3.${C_RESET} 先執行1再執行2"
+  echo -e "  ${C_GREEN}4.${C_RESET} 檢查並更新"
+  echo -e "  ${C_RED}5.${C_RESET} 刪除"
   echo -e "------------------------------------------------------------------------"
-  printf "請輸入選項 [0-3]: "
+  printf "請輸入選項 [0-5]: "
 
   if [ -t 0 ]; then
     if ! read -r choice; then
@@ -668,8 +781,17 @@ while true; do
       run_stage3
       echo ""
       ;;
+    4)
+      echo -e "------------------------------------------------------------------------"
+      run_stage4
+      echo ""
+      ;;
+    5)
+      echo -e "------------------------------------------------------------------------"
+      run_stage5
+      ;;
     *)
-      echo -e "${C_RED}⚠️  無效選項 '${choice}'，請輸入 0、1、2 或 3。${C_RESET}"
+      echo -e "${C_RED}⚠️  無效選項 '${choice}'，請輸入 0 ~ 5 之間的數字。${C_RESET}"
       echo -e "------------------------------------------------------------------------"
       ;;
   esac

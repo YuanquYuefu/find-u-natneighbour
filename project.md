@@ -6,18 +6,20 @@
 
 | 版本 | 腳本 | 說明文檔 | 適用範圍 |
 | --- | --- | --- | --- |
-| 通用版 1.1.0 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ 架構之 NAT VPS，提供 `0/1/2/3` 互動菜單與免菜單快捷模式，完成同區鄰居人數普查、真實買家識別與活躍鄰居排行 |
+| 通用版 1.2.0 | [nat.sh](nat.sh) | [README.md](README.md) | 通用於 KVM / LXC / OpenVZ 架構之 NAT VPS，提供 `0~5` 互動菜單與免菜單快捷模式，支援 IPv6/IPv4 自動容錯下載更新，完成同區鄰居人數普查、真實買家識別與活躍鄰居排行 |
 
 ## 設計目標與行為規範
 
 1. **一鍵安裝與互動菜單呼叫**：
-   - 支援使用者透過單行 `wget` 指令直接從 `https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh` 下載至 `/usr/local/bin/nat`（或下載為 `nat.sh` 首次執行時自動安裝至 `/usr/local/bin/nat`）。
+   - 支援使用者透過單行非靜默 `wget` 指令（強制 `wget -6 ... || wget -4 ...` IPv6/IPv4 自動容錯並顯示即時進度）從 `https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh` 下載至 `/usr/local/bin/nat`（或下載為 `nat.sh` 首次執行時自動安裝至 `/usr/local/bin/nat`）。
    - 在 LXC / KVM 終端機中直接輸入 `nat` 無參數執行時，喚出互動式數字菜單：
      - `0. 退出`：退出工具
      - `1. 看看你有多少鄰居`：執行階段一（同網段二層 ARP 鄰居人數普查與真實買家過濾）
      - `2. 看看此時你有多少活躍鄰居`：執行階段二（自動定位在線鄰居，進行母雞外網負載基準測試與鄰居活躍度排行榜，統計當下活躍鄰居人數）
      - `3. 先執行1再執行2`：先執行選項 `1` 輸出完整鄰居清單，再直接沿用該次掃描名單無縫執行選項 `2` 活躍度排行
-   - 同時支援命令列快捷參數（`nat 1` / `nat -q`、`nat 2` / `nat --active`、`nat 3` / `nat --both`）免菜單直接執行。
+     - `4. 檢查並更新`：強制透過 IPv6 / IPv4 自動容錯連線 GitHub 拉取最新版本的 `nat.sh` 並自動覆蓋更新
+     - `5. 刪除`：移除 `/usr/local/bin/nat` 全局快捷指令與本地腳本
+   - 同時支援命令列快捷參數（`nat 1` / `nat -q`、`nat 2` / `nat --active`、`nat 3` / `nat --both`、`nat 4` / `nat -u`、`nat 5` / `nat --uninstall`）免菜單直接執行。
 
 2. **跨環境通用性（KVM / LXC / 多系統相容）**：
    - 自動偵測預設路由網卡（相容 `eth0`、`ens18`、`enp0s3` 及 LXC 的 `eth0@if...` 格式）、內網網段、預設網關與公網出口 IPv4，不硬編碼特定網段（如 `192.168.30.x`）。

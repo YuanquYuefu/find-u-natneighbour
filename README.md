@@ -1,22 +1,22 @@
 # find-u-natneighbour — NAT VPS 鄰居普查與活躍度探測工具
 
-**v1.1.0** · 倉庫：[YuanquYuefu/find-u-natneighbour](https://github.com/YuanquYuefu/find-u-natneighbour) · 腳本：[nat.sh](nat.sh) · 項目約定：[project.md](project.md)
+**v1.2.0** · 倉庫：[YuanquYuefu/find-u-natneighbour](https://github.com/YuanquYuefu/find-u-natneighbour) · 腳本：[nat.sh](nat.sh) · 項目約定：[project.md](project.md)
 
-這是一個適用於各類 **KVM / LXC / OpenVZ** 架構 NAT VPS（「NAT 小雞」）的通用二層鄰居普查與活躍度分析腳本。只需透過一行 `wget` 指令安裝，之後在終端機直接輸入 `nat` 即可喚出互動菜單，自由選擇 **「看看你有多少鄰居」**、**「看看此時你有多少活躍鄰居」** 或 **「先執行1再執行2」**。
+這是一個適用於各類 **KVM / LXC / OpenVZ** 架構 NAT VPS（「NAT 小雞」）的通用二層鄰居普查與活躍度分析腳本。只需透過一行指令下載安裝（支援 **IPv6 / IPv4 自動容錯** 並顯示即時下載進度），之後在終端機直接輸入 `nat` 即可喚出互動菜單。
 
 ---
 
 ## 一鍵安裝與使用
 
-### 1. 下載並註冊 `nat` 快捷指令
+### 1. 下載並註冊 `nat` 快捷指令（IPv6 / IPv4 自動容錯）
 
-在你的 LXC 或 KVM 機器終端機（SSH）中執行以下一行指令即可完成安裝：
+在你的 LXC 或 KVM 機器終端機（SSH）中執行以下指令即可完成安裝（強制優先嘗試 IPv6，若無 IPv6 則自動切換 IPv4 下載，並顯示完整下載進度）：
 
 ```bash
-wget -qO /usr/local/bin/nat https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh && chmod +x /usr/local/bin/nat
+(wget -6 --timeout=10 --tries=1 -O /usr/local/bin/nat https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh || wget -4 --timeout=10 --tries=2 -O /usr/local/bin/nat https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh) && chmod +x /usr/local/bin/nat
 ```
 
-*(或者直接下載 `nat.sh` 執行：`wget -qO nat.sh https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh && bash nat.sh`，腳本首次運行時也會自動將自己註冊到 `/usr/local/bin/nat`。)*
+*(或者下載至當前目錄並直接執行：` (wget -6 --timeout=10 --tries=1 -O nat.sh https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh || wget -4 --timeout=10 --tries=2 -O nat.sh https://raw.githubusercontent.com/YuanquYuefu/find-u-natneighbour/main/nat.sh) && bash nat.sh`，腳本首次運行時也會自動將自己註冊到 `/usr/local/bin/nat`。)*
 
 ### 2. 輸入 `nat` 喚出互動菜單
 
@@ -30,7 +30,7 @@ nat
 
 ```text
 ========================================================================
-🛰️  NAT 鄰居普查與活躍度探測工具 v1.1.0  (架構: KVM | 介面: eth0)
+🛰️  NAT 鄰居普查與活躍度探測工具 v1.2.0  (架構: KVM | 介面: eth0)
 ========================================================================
 📍 本機內網 IP : 192.168.30.108 (/24)   MAC: 6a:1f:xx:xx:xx:xx
 🛣️  內網預設網關: 192.168.30.1           共享公網 IPv4: 114.36.x.x
@@ -39,14 +39,18 @@ nat
   1. 看看你有多少鄰居
   2. 看看此時你有多少活躍鄰居
   3. 先執行1再執行2
+  4. 檢查並更新
+  5. 刪除
 ------------------------------------------------------------------------
-請輸入選項 [0-3]:
+請輸入選項 [0-5]:
 ```
 
 * **`0. 退出`**：退出腳本。
 * **`1. 看看你有多少鄰居`**：約 2 秒快速完成二層 ARP 鄰居普查與真實買家識別，列出所有在線買家鄰居並自動排除網關、母雞與老闆手動測試機。
 * **`2. 看看此時你有多少活躍鄰居`**：自動定位當前在線鄰居並進行 50 次高頻微抖動採樣（約 7 秒），輸出母雞外網負載基準、鄰居活躍度排行榜與當下活躍鄰居人數。
 * **`3. 先執行1再執行2`**：先完整執行選項 `1`（輸出鄰居清單與總人數），再無縫接續執行選項 `2`（直接沿用剛掃描的鄰居名單進行活躍度採樣排行）。
+* **`4. 檢查並更新`**：強制透過 IPv6 / IPv4 自動容錯從 GitHub 拉取最新版本的 `nat.sh` 並自動覆蓋更新 `/usr/local/bin/nat`。
+* **`5. 刪除`**：一鍵移除系統中的 `/usr/local/bin/nat` 全局快捷指令與本地腳本。
 
 ---
 
@@ -56,14 +60,15 @@ nat
 
 | 指令 / 參數 | 行為說明 |
 | :--- | :--- |
-| `nat` | **互動菜單模式（預設）**：喚出 `0 / 1 / 2 / 3` 數字菜單 |
+| `nat` | **互動菜單模式（預設）**：喚出 `0 ~ 5` 數字菜單 |
 | `nat 1` 或 `nat -q` / `--quick` | 免菜單直接執行 **「1. 看看你有多少鄰居」**（約 2 秒完成） |
 | `nat 2` 或 `nat --active` | 免菜單直接執行 **「2. 看看此時你有多少活躍鄰居」** |
 | `nat 3` 或 `nat --both` | 免菜單直接執行 **「3. 先執行1再執行2」** |
+| `nat 4` 或 `nat -u` / `--update` | 免菜單直接執行 **「4. 檢查並更新」**（IPv6/IPv4 自動容錯更新） |
+| `nat 5` 或 `nat --uninstall` | 免菜單直接執行 **「5. 刪除」**（移除 `/usr/local/bin/nat`） |
 | `nat -c 100` | 自訂每台鄰居的高頻 Ping 採樣次數（預設 `50` 次，最少 `5` 次） |
 | `nat -a` 或 `nat --all` | 將自動排除的老闆/母雞系統節點也一併納入活躍度排行榜 |
 | `nat --install` | 手動將本腳本安裝或更新至 `/usr/local/bin/nat` |
-| `nat --uninstall` | 從系統中移除 `/usr/local/bin/nat` 快捷指令 |
 | `nat -h` 或 `nat --help` | 顯示參數與菜單說明 |
 
 ---
@@ -100,7 +105,7 @@ nat
 
 ```text
 ========================================================================
-🛰️  NAT 鄰居普查與活躍度探測工具 v1.1.0  (架構: KVM | 介面: eth0)
+🛰️  NAT 鄰居普查與活躍度探測工具 v1.2.0  (架構: KVM | 介面: eth0)
 ========================================================================
 📍 本機內網 IP : 192.168.30.108 (/24)   MAC: 6a:1f:xx:xx:xx:xx
 🛣️  內網預設網關: 192.168.30.1           共享公網 IPv4: 114.36.x.x
@@ -109,8 +114,10 @@ nat
   1. 看看你有多少鄰居
   2. 看看此時你有多少活躍鄰居
   3. 先執行1再執行2
+  4. 檢查並更新
+  5. 刪除
 ------------------------------------------------------------------------
-請輸入選項 [0-3]: 3
+請輸入選項 [0-5]: 3
 ------------------------------------------------------------------------
 🔍 [1. 看看你有多少鄰居] 正在併發掃描 192.168.30.0/24 二層 ARP 與存活主機（約 2 秒）...
 
@@ -158,13 +165,17 @@ nat
 
 ## 版本變更記錄
 
+* **v1.2.0**：
+  * 安裝與更新指令改為非靜默模式（顯示即時進度），並強制使用 **IPv6 / IPv4 自動容錯下載**（`wget -6 ... || wget -4 ...`），徹底解決純 IPv6、純 IPv4 或雙棧環境下連線 GitHub 卡死的問題。
+  * 互動菜單新增 **`4. 檢查並更新`** 與 **`5. 刪除`** 兩個選項（亦支援 `nat 4` / `nat -u` 與 `nat 5` / `nat --uninstall` 直接執行）。
 * **v1.1.0**：
   * 新增 `nat` 互動式數字菜單（`0. 退出` / `1. 看看你有多少鄰居` / `2. 看看此時你有多少活躍鄰居` / `3. 先執行1再執行2`），並支援執行後循環操作或透過 `nat 1`、`nat 2`、`nat 3` 免菜單直接呼叫。
   * 支援單獨執行選項 `2`（自動快速定位在線鄰居並進行活躍度微抖動分析，直接統計當下活躍鄰居總人數）。
-  * 更新 GitHub 倉庫地址為 [`YuanquYuefu/find-u-natneighbour`](https://github.com/YuanquYuefu/find-u-natneighbour)，提供可直接複製執行的一鍵 `wget` 安裝指令。
+  * 更新 GitHub 倉庫地址為 [`YuanquYuefu/find-u-natneighbour`](https://github.com/YuanquYuefu/find-u-natneighbour)。
 * **v1.0.0**：
   * 初版發布：支援 KVM / LXC / OpenVZ 全環境自動偵測網卡、網關、虛擬化類型與外部共享公網 IPv4。
   * 新增多維度真實買家識別邏輯（自動過濾預設網關、PVE/KVM 原生固定 OUI 系統機、母雞橋接與探針節點，並支援識別開啟禁 Ping 防火牆的二層存活鄰居）。
   * 內建錯峰高頻微抖動採樣（RTT Micro-Jitter Profiling）與最近外網基準自動選擇，輸出鄰居活躍度排行榜。
   * 支援透過 `wget` 下載並自動註冊 `/usr/local/bin/nat` 全局快捷指令。
+
 
